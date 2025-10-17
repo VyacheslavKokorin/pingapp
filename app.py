@@ -6,6 +6,7 @@ import hashlib
 import html
 import json
 import os
+import platform
 import secrets
 import threading
 import time
@@ -164,13 +165,16 @@ class PingWorker:
     def _ping(ip: str) -> str:
         from subprocess import DEVNULL, CalledProcessError, run
 
+        system = platform.system().lower()
+        if system == "windows":
+            cmd = ["ping", "-n", "1", "-w", "1000", ip]
+        elif system == "darwin":
+            cmd = ["ping", "-c", "1", "-W", "1000", ip]
+        else:
+            cmd = ["ping", "-c", "1", "-W", "1", ip]
+
         try:
-            result = run(
-                ["ping", "-c", "1", "-W", "1", ip],
-                check=True,
-                stdout=DEVNULL,
-                stderr=DEVNULL,
-            )
+            result = run(cmd, check=True, stdout=DEVNULL, stderr=DEVNULL)
             return "online" if result.returncode == 0 else "offline"
         except (FileNotFoundError, CalledProcessError):
             return "offline"
