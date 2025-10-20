@@ -235,7 +235,9 @@ def html_escape(value: str) -> str:
     return html.escape(value, quote=True)
 
 
-def dashboard_page(store: DataStore, query: dict[str, str]) -> bytes:
+def filter_and_sort_hosts(
+    store: DataStore, query: dict[str, str]
+) -> tuple[list[dict], str, str, str, str]:
     group_filter = query.get("group_filter", "").strip()
     status_filter = query.get("status_filter", "").strip()
     sort_column = query.get("sort", "computer")
@@ -256,6 +258,14 @@ def dashboard_page(store: DataStore, query: dict[str, str]) -> bytes:
 
     reverse = sort_dir == "desc"
     hosts.sort(key=key_func, reverse=reverse)
+
+    return hosts, group_filter, status_filter, sort_column, sort_dir
+
+
+def dashboard_page(store: DataStore, query: dict[str, str]) -> bytes:
+    hosts, group_filter, status_filter, sort_column, sort_dir = filter_and_sort_hosts(
+        store, query
+    )
 
     def sort_link(column: str, label: str) -> str:
         direction = "desc" if (sort_column == column and sort_dir == "asc") else "asc"
@@ -332,7 +342,7 @@ def dashboard_page(store: DataStore, query: dict[str, str]) -> bytes:
           <th>Last update</th>
         </tr>
       </thead>
-      <tbody>
+      <tbody data-hosts-table>
         {rows}
       </tbody>
     </table>
@@ -345,7 +355,93 @@ def dashboard_page(store: DataStore, query: dict[str, str]) -> bytes:
         rows="".join(rows) if rows else "<tr><td colspan='5'>No computers added yet.</td></tr>",
     )
 
-    content = add_form + table_html
+    auto_refresh_script = """
+    <script>
+    (function() {
+      const tableBody = document.querySelector('[data-hosts-table]');
+      if (!tableBody) {
+        return;
+      }
+
+      const statusClass = (status) => {
+        switch ((status || '').toLowerCase()) {
+          case 'online':
+            return 'status-online';
+          case 'offline':
+            return 'status-offline';
+          default:
+            return 'status-unknown';
+        }
+      };
+
+      const renderHosts = (hosts) => {
+        tableBody.innerHTML = '';
+        if (!hosts.length) {
+          const row = document.createElement('tr');
+          const cell = document.createElement('td');
+          cell.colSpan = 5;
+          cell.textContent = 'No computers added yet.';
+          row.appendChild(cell);
+          tableBody.appendChild(row);
+          return;
+        }
+
+        hosts.forEach((host) => {
+          const row = document.createElement('tr');
+
+          const computerCell = document.createElement('td');
+          computerCell.textContent = host.computer || '';
+          row.appendChild(computerCell);
+
+          const groupCell = document.createElement('td');
+          groupCell.textContent = host.group || '';
+          row.appendChild(groupCell);
+
+          const ipCell = document.createElement('td');
+          ipCell.textContent = host.ip || '';
+          row.appendChild(ipCell);
+
+          const statusCell = document.createElement('td');
+          statusCell.className = statusClass(host.status);
+          statusCell.textContent = host.status || 'unknown';
+          row.appendChild(statusCell);
+
+          const updatedCell = document.createElement('td');
+          updatedCell.textContent = host.last_update || '–';
+          row.appendChild(updatedCell);
+
+          tableBody.appendChild(row);
+        });
+      };
+
+      const fetchHosts = () => {
+        const params = new URLSearchParams(window.location.search);
+        const query = params.toString();
+        const url = '/api/hosts' + (query ? `?${query}` : '');
+        fetch(url, { headers: { 'Accept': 'application/json' } })
+          .then((response) => {
+            if (!response.ok) {
+              throw new Error('Network response was not ok');
+            }
+            return response.json();
+          })
+          .then((data) => {
+            if (data && Array.isArray(data.hosts)) {
+              renderHosts(data.hosts);
+            }
+          })
+          .catch(() => {
+            // Ignore refresh errors; the worker will try again on the next interval.
+          });
+      };
+
+      fetchHosts();
+      setInterval(fetchHosts, 5000);
+    })();
+    </script>
+    """
+
+    content = add_form + table_html + auto_refresh_script
     return render_template("Dashboard", content)
 
 
@@ -435,6 +531,23 @@ def application_factory(store: DataStore, sessions: SessionStore):
             content = dashboard_page(store, query)
             return _respond(start_response, "200 OK", content)
 
+        if path == "/api/hosts":
+            hosts, *_ = filter_and_sort_hosts(store, query)
+            payload = {
+                "hosts": [
+                    {
+                        "id": host.get("id"),
+                        "computer": host.get("computer", ""),
+                        "group": host.get("group", ""),
+                        "ip": host.get("ip", ""),
+                        "status": host.get("status", "unknown"),
+                        "last_update": _format_ts(host.get("last_update")),
+                    }
+                    for host in hosts
+                ]
+            }
+            return json_response(start_response, "200 OK", payload)
+
         if path == "/add" and method == "POST":
             data = parse_post(environ)
             computer = data.get("computer", "").strip()
@@ -469,6 +582,13 @@ def application_factory(store: DataStore, sessions: SessionStore):
 
 def _respond(start_response, status: str, body: bytes):
     headers = [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body)))]
+    start_response(status, headers)
+    return [body]
+
+
+def json_response(start_response, status: str, payload: dict):
+    body = json.dumps(payload).encode("utf-8")
+    headers = [("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
     start_response(status, headers)
     return [body]
 
