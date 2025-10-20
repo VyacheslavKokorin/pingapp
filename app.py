@@ -82,7 +82,12 @@ class DataStore:
                 pass
 
     def _append_host_log(self, host_id: str, timestamp: float, status: str) -> None:
-        iso = dt.datetime.utcfromtimestamp(timestamp).replace(microsecond=0).isoformat() + "Z"
+        iso = (
+            dt.datetime.fromtimestamp(timestamp, dt.timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
         entry = {"ts": timestamp, "timestamp": iso, "status": status}
         path = self._log_file_path(host_id)
         with open(path, "a", encoding="utf-8") as fh:
