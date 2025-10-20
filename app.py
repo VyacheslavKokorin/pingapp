@@ -573,9 +573,35 @@ def dashboard_page(store: DataStore, query: dict[str, str]) -> bytes:
           ctx.fillText(date.toLocaleTimeString(), x, canvas.height - padding + 20);
         });
 
-        ctx.textAlign = 'left';
-        ctx.fillText('Online', padding + 8, padding + 16);
-        ctx.fillText('Offline', padding + 8, canvas.height - padding - 8);
+        const offlineTransitions = [];
+        for (let i = 1; i < sorted.length; i += 1) {
+          const previousStatus = (sorted[i - 1].status || 'unknown').toLowerCase();
+          const currentStatus = (sorted[i].status || 'unknown').toLowerCase();
+          if (previousStatus === 'online' && currentStatus === 'offline') {
+            offlineTransitions.push(sorted[i]);
+          }
+        }
+
+        if (offlineTransitions.length) {
+          ctx.save();
+          ctx.strokeStyle = '#c0392b';
+          ctx.fillStyle = '#c0392b';
+          ctx.font = '12px Arial';
+          ctx.textAlign = 'center';
+          offlineTransitions.forEach((entry) => {
+            const ts = entry.ts || minTime;
+            const ratio = ((ts - minTime) / duration);
+            const x = padding + ratio * chartWidth;
+            ctx.beginPath();
+            ctx.moveTo(x, padding);
+            ctx.lineTo(x, canvas.height - padding);
+            ctx.stroke();
+            const date = new Date(ts * 1000);
+            const label = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            ctx.fillText(label, x, padding - 10);
+          });
+          ctx.restore();
+        }
       };
 
       const renderEventsList = (entries) => {
