@@ -574,11 +574,15 @@ def dashboard_page(store: DataStore, query: dict[str, str]) -> bytes:
         });
 
         const offlineTransitions = [];
+        const onlineTransitions = [];
         for (let i = 1; i < sorted.length; i += 1) {
           const previousStatus = (sorted[i - 1].status || 'unknown').toLowerCase();
           const currentStatus = (sorted[i].status || 'unknown').toLowerCase();
           if (previousStatus === 'online' && currentStatus === 'offline') {
             offlineTransitions.push(sorted[i]);
+          }
+          if (previousStatus === 'offline' && currentStatus === 'online') {
+            onlineTransitions.push(sorted[i]);
           }
         }
 
@@ -599,6 +603,28 @@ def dashboard_page(store: DataStore, query: dict[str, str]) -> bytes:
             const date = new Date(ts * 1000);
             const label = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
             ctx.fillText(label, x, padding - 10);
+          });
+          ctx.restore();
+        }
+
+        if (onlineTransitions.length) {
+          ctx.save();
+          ctx.strokeStyle = '#27ae60';
+          ctx.fillStyle = '#27ae60';
+          ctx.font = '12px Arial';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'top';
+          onlineTransitions.forEach((entry) => {
+            const ts = entry.ts || minTime;
+            const ratio = ((ts - minTime) / duration);
+            const x = padding + ratio * chartWidth;
+            ctx.beginPath();
+            ctx.moveTo(x, padding);
+            ctx.lineTo(x, canvas.height - padding);
+            ctx.stroke();
+            const date = new Date(ts * 1000);
+            const label = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            ctx.fillText(label, x, canvas.height - padding + 6);
           });
           ctx.restore();
         }
