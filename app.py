@@ -12,16 +12,31 @@ import threading
 import time
 import urllib.parse
 import uuid
+from collections import deque
 from http import cookies
 from wsgiref.simple_server import make_server
 
-DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.path.join(BASE_DIR, "data.json")
+LOGS_DIR = os.path.join(BASE_DIR, "LOGS")
+UTC = getattr(dt, "UTC", dt.timezone.utc)
+
+os.makedirs(LOGS_DIR, exist_ok=True)
 PING_INTERVAL = 2  # seconds
 SESSION_TTL = 3600  # seconds
 
 
 def _now() -> dt.datetime:
-    return dt.datetime.utcnow()
+    return dt.datetime.now(UTC)
+
+
+def _isoformat_utc(timestamp: float | int | dt.datetime) -> str:
+    if isinstance(timestamp, dt.datetime):
+        dt_obj = timestamp.astimezone(UTC) if timestamp.tzinfo else timestamp.replace(tzinfo=UTC)
+    else:
+        dt_obj = dt.datetime.fromtimestamp(float(timestamp), UTC)
+    dt_obj = dt_obj.replace(microsecond=0)
+    return dt_obj.isoformat().replace("+00:00", "Z")
 
 
 def _format_ts(ts: float | None) -> str:
@@ -61,6 +76,26 @@ class DataStore:
             self.data["password_hash"] = digest
             self.data["salt"] = salt
             self._save()
+        for host in self.data.get("hosts", []):
+            host_id = host.get("id")
+            if host_id:
+                self._ensure_log_file(host_id)
+
+    @staticmethod
+    def _log_file_path(host_id: str) -> str:
+        return os.path.join(LOGS_DIR, f"{host_id}.log")
+
+    def _ensure_log_file(self, host_id: str) -> None:
+        path = self._log_file_path(host_id)
+        if not os.path.exists(path):
+            with open(path, "a", encoding="utf-8"):
+                pass
+
+    def _append_host_log(self, host_id: str, timestamp: float, status: str) -> None:
+        entry = {"ts": timestamp, "timestamp": _isoformat_utc(timestamp), "status": status}
+        path = self._log_file_path(host_id)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
 
     def _save(self) -> None:
         with open(self.path, "w", encoding="utf-8") as fh:
@@ -92,6 +127,7 @@ class DataStore:
         }
         with self.lock:
             self.data["hosts"].append(host)
+            self._ensure_log_file(host["id"])
             self._save()
 
     def update_host_status(self, host_id: str, status: str) -> None:
@@ -101,8 +137,45 @@ class DataStore:
                 if host["id"] == host_id:
                     host["status"] = status
                     host["last_update"] = timestamp
+                    self._append_host_log(host_id, timestamp, status)
                     break
             self._save()
+
+    def get_host(self, host_id: str) -> dict | None:
+        with self.lock:
+            for host in self.data["hosts"]:
+                if host["id"] == host_id:
+                    return host.copy()
+        return None
+
+    def get_host_log(self, host_id: str, limit: int = 1000) -> list[dict]:
+        path = self._log_file_path(host_id)
+        if not os.path.exists(path):
+            return []
+        entries: deque[dict] = deque(maxlen=limit)
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "ts" not in entry and "timestamp" in entry:
+                    try:
+                        dt_obj = dt.datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00"))
+                        if dt_obj.tzinfo is None:
+                            dt_obj = dt_obj.replace(tzinfo=UTC)
+                        else:
+                            dt_obj = dt_obj.astimezone(UTC)
+                        entry["ts"] = dt_obj.timestamp()
+                    except ValueError:
+                        entry["ts"] = 0.0
+                if "timestamp" not in entry and "ts" in entry:
+                    entry["timestamp"] = _isoformat_utc(float(entry["ts"]))
+                entries.append(entry)
+        return list(entries)
 
 
 class SessionStore:
@@ -217,6 +290,20 @@ def render_template(title: str, content: str, user_authenticated: bool = True) -
     .status-offline {{ color: red; font-weight: bold; }}
     .status-unknown {{ color: #666; font-weight: bold; }}
     .container {{ max-width: 900px; margin: 0 auto; }}
+    .link-button {{ background: none; border: none; color: #06c; text-decoration: underline; cursor: pointer; padding: 0; font: inherit; }}
+    .link-button:focus {{ outline: 2px solid #06c; outline-offset: 2px; }}
+    .modal {{ display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0, 0, 0, 0.5); align-items: center; justify-content: center; z-index: 1000; padding: 1rem; }}
+    .modal.visible {{ display: flex; }}
+    .modal-content {{ background: #fff; border-radius: 6px; max-width: 960px; width: 100%; padding: 1.5rem; position: relative; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2); }}
+    .modal-close {{ position: absolute; top: 0.5rem; right: 0.5rem; background: none; border: none; font-size: 1.5rem; cursor: pointer; }}
+    .modal-close:hover {{ color: #c00; }}
+    #host-modal-chart {{ width: 100%; max-width: 100%; border: 1px solid #ddd; margin-top: 1rem; background: #fefefe; }}
+    .modal-status {{ margin-top: 1rem; font-weight: bold; }}
+    .modal-events {{ list-style: none; padding-left: 0; max-height: 200px; overflow-y: auto; margin-top: 1rem; }}
+    .modal-events li {{ padding: 0.25rem 0; border-bottom: 1px solid #eee; }}
+    .modal-legend {{ margin-top: 0.5rem; display: flex; gap: 1rem; flex-wrap: wrap; }}
+    .modal-legend span {{ display: inline-flex; align-items: center; gap: 0.3rem; }}
+    .legend-swatch {{ width: 12px; height: 12px; border-radius: 2px; display: inline-block; }}
   </style>
 </head>
 <body>
@@ -279,16 +366,26 @@ def dashboard_page(store: DataStore, query: dict[str, str]) -> bytes:
     for host in hosts:
         status = host.get("status", "unknown")
         css = f"status-{status}"
-        rows.append(
-            "<tr>"
-            f"<td>{html_escape(host.get('computer', ''))}</td>"
-            f"<td>{html_escape(host.get('group', ''))}</td>"
-            f"<td>{html_escape(host.get('ip', ''))}</td>"
-            f"<td class='{css}'>{html_escape(status)}</td>"
-            f"<td>{html_escape(_format_ts(host.get('last_update')))}</td>"
-            "</tr>"
+        host_id = html_escape(host.get("id", ""))
+        computer_name = html_escape(host.get("computer", "")) or "Unnamed"
+        row_html = "".join(
+            [
+                "<tr>",
+                (
+                    "<td>"
+                    f"<button type='button' class='link-button' data-host-button data-host-id='{host_id}' data-host-name='{computer_name}'>"
+                    f"{computer_name}"
+                    "</button>"
+                    "</td>"
+                ),
+                f"<td>{html_escape(host.get('group', ''))}</td>",
+                f"<td>{html_escape(host.get('ip', ''))}</td>",
+                f"<td class='{css}'>{html_escape(status)}</td>",
+                f"<td>{html_escape(_format_ts(host.get('last_update')))}</td>",
+                "</tr>",
+            ]
         )
-
+        rows.append(row_html)
     group_options = sorted({h.get("group", "") for h in store.get_hosts() if h.get("group")})
     status_options = ["online", "offline", "unknown"]
 
@@ -355,10 +452,34 @@ def dashboard_page(store: DataStore, query: dict[str, str]) -> bytes:
         rows="".join(rows) if rows else "<tr><td colspan='5'>No computers added yet.</td></tr>",
     )
 
+    modal_html = """
+    <div id=\"host-modal\" class=\"modal\" data-host-modal aria-hidden=\"true\">
+      <div class=\"modal-content\">
+        <button type=\"button\" class=\"modal-close\" data-modal-close aria-label=\"Close\">&times;</button>
+        <h3 id=\"host-modal-title\"></h3>
+        <div class=\"modal-legend\">
+          <span><span class=\"legend-swatch\" style=\"background:#2ecc71;\"></span>Online</span>
+          <span><span class=\"legend-swatch\" style=\"background:#e74c3c;\"></span>Offline</span>
+          <span><span class=\"legend-swatch\" style=\"background:#95a5a6;\"></span>Unknown</span>
+        </div>
+        <canvas id=\"host-modal-chart\" width=\"900\" height=\"260\"></canvas>
+        <p id=\"host-modal-status\" class=\"modal-status\"></p>
+        <ul id=\"host-modal-events\" class=\"modal-events\"></ul>
+      </div>
+    </div>
+    """
+
     auto_refresh_script = """
     <script>
     (function() {
       const tableBody = document.querySelector('[data-hosts-table]');
+      const modal = document.querySelector('[data-host-modal]');
+      const modalTitle = document.getElementById('host-modal-title');
+      const modalStatus = document.getElementById('host-modal-status');
+      const eventsList = document.getElementById('host-modal-events');
+      const modalClose = document.querySelector('[data-modal-close]');
+      const canvas = document.getElementById('host-modal-chart');
+      const ctx = canvas ? canvas.getContext('2d') : null;
       if (!tableBody) {
         return;
       }
@@ -372,6 +493,180 @@ def dashboard_page(store: DataStore, query: dict[str, str]) -> bytes:
           default:
             return 'status-unknown';
         }
+      };
+
+      const closeModal = () => {
+        if (!modal) {
+          return;
+        }
+        modal.classList.remove('visible');
+        modal.setAttribute('aria-hidden', 'true');
+      };
+
+      if (modalClose) {
+        modalClose.addEventListener('click', closeModal);
+      }
+      if (modal) {
+        modal.addEventListener('click', (event) => {
+          if (event.target === modal) {
+            closeModal();
+          }
+        });
+        document.addEventListener('keydown', (event) => {
+          if (event.key === 'Escape' && modal.classList.contains('visible')) {
+            closeModal();
+          }
+        });
+      }
+
+      const drawHostChart = (entries) => {
+        if (!ctx || !canvas) {
+          return;
+        }
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#f8f8f8';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        const padding = 40;
+        const chartWidth = canvas.width - padding * 2;
+        const chartHeight = canvas.height - padding * 2;
+
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(padding, padding);
+        ctx.lineTo(padding, canvas.height - padding);
+        ctx.lineTo(canvas.width - padding, canvas.height - padding);
+        ctx.stroke();
+
+        if (!entries.length) {
+          ctx.fillStyle = '#333';
+          ctx.font = '14px Arial';
+          ctx.textAlign = 'center';
+          ctx.fillText('No ping data to display', canvas.width / 2, canvas.height / 2);
+          return;
+        }
+
+        const sorted = entries.slice().sort((a, b) => (a.ts || 0) - (b.ts || 0));
+        const minTime = sorted[0].ts || 0;
+        const maxTime = sorted[sorted.length - 1].ts || minTime;
+        const duration = Math.max(maxTime - minTime, 1);
+        const colors = { online: '#2ecc71', offline: '#e74c3c', unknown: '#95a5a6' };
+
+        sorted.forEach((entry, index) => {
+          const status = (entry.status || 'unknown').toLowerCase();
+          const color = colors[status] || '#999';
+          const start = ((entry.ts || minTime) - minTime) / duration;
+          const endValue = index < sorted.length - 1 ? ((sorted[index + 1].ts || maxTime) - minTime) / duration : 1;
+          const x1 = padding + start * chartWidth;
+          const x2 = padding + endValue * chartWidth;
+          ctx.fillStyle = color;
+          ctx.fillRect(x1, padding, Math.max(x2 - x1, 2), chartHeight);
+        });
+
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.6)';
+        ctx.beginPath();
+        ctx.moveTo(padding, padding + chartHeight / 2);
+        ctx.lineTo(canvas.width - padding, padding + chartHeight / 2);
+        ctx.stroke();
+
+        ctx.fillStyle = '#333';
+        ctx.font = '12px Arial';
+        ctx.textAlign = 'center';
+        const labelTimes = [minTime, minTime + duration / 2, maxTime];
+        labelTimes.forEach((value) => {
+          const x = padding + ((value - minTime) / duration) * chartWidth;
+          const date = new Date(value * 1000);
+          ctx.fillText(date.toLocaleTimeString(), x, canvas.height - padding + 20);
+        });
+
+        ctx.textAlign = 'left';
+        ctx.fillText('Online', padding + 8, padding + 16);
+        ctx.fillText('Offline', padding + 8, canvas.height - padding - 8);
+      };
+
+      const renderEventsList = (entries) => {
+        if (!eventsList) {
+          return;
+        }
+        eventsList.innerHTML = '';
+        if (!entries.length) {
+          const li = document.createElement('li');
+          li.textContent = 'No ping data recorded yet.';
+          eventsList.appendChild(li);
+          return;
+        }
+        const recent = entries.slice(-50).reverse();
+        recent.forEach((entry) => {
+          const li = document.createElement('li');
+          const statusText = (entry.status || 'unknown').toUpperCase();
+          const ts = entry.ts || (entry.timestamp ? Date.parse(entry.timestamp) / 1000 : 0);
+          const date = new Date(ts * 1000);
+          li.textContent = `${statusText} — ${date.toLocaleString()}`;
+          eventsList.appendChild(li);
+        });
+      };
+
+      const openHostModal = (hostId, hostName) => {
+        if (!modal) {
+          return;
+        }
+        modal.classList.add('visible');
+        modal.setAttribute('aria-hidden', 'false');
+        if (modalTitle) {
+          modalTitle.textContent = hostName || 'Computer';
+        }
+        if (modalStatus) {
+          modalStatus.textContent = 'Loading ping history...';
+        }
+        renderEventsList([]);
+        drawHostChart([]);
+        const url = `/api/host_log?host_id=${encodeURIComponent(hostId)}`;
+        fetch(url, { headers: { 'Accept': 'application/json' } })
+          .then((response) => {
+            if (!response.ok) {
+              throw new Error('Network error');
+            }
+            return response.json();
+          })
+          .then((data) => {
+            const entries = data && Array.isArray(data.entries) ? data.entries : [];
+            drawHostChart(entries);
+            renderEventsList(entries);
+            if (modalStatus) {
+              if (!entries.length) {
+                modalStatus.textContent = 'No ping data recorded yet.';
+              } else {
+                const last = entries[entries.length - 1];
+                const ts = last.ts || (last.timestamp ? Date.parse(last.timestamp) / 1000 : 0);
+                const date = new Date(ts * 1000);
+                const statusText = (last.status || 'unknown').toUpperCase();
+                modalStatus.textContent = `Last ping: ${statusText} at ${date.toLocaleString()}`;
+              }
+            }
+            if (data && data.host && modalTitle && data.host.computer) {
+              modalTitle.textContent = data.host.computer;
+            }
+          })
+          .catch(() => {
+            if (modalStatus) {
+              modalStatus.textContent = 'Unable to load ping history.';
+            }
+          });
+      };
+
+      const attachHostHandlers = () => {
+        tableBody.querySelectorAll('[data-host-button]').forEach((button) => {
+          if (button.dataset.bound === '1') {
+            return;
+          }
+          button.dataset.bound = '1';
+          button.addEventListener('click', () => {
+            const hostId = button.getAttribute('data-host-id') || '';
+            const hostName = button.getAttribute('data-host-name') || button.textContent || 'Computer';
+            openHostModal(hostId, hostName);
+          });
+        });
       };
 
       const renderHosts = (hosts) => {
@@ -390,7 +685,14 @@ def dashboard_page(store: DataStore, query: dict[str, str]) -> bytes:
           const row = document.createElement('tr');
 
           const computerCell = document.createElement('td');
-          computerCell.textContent = host.computer || '';
+          const computerButton = document.createElement('button');
+          computerButton.type = 'button';
+          computerButton.className = 'link-button';
+          computerButton.setAttribute('data-host-button', 'true');
+          computerButton.setAttribute('data-host-id', host.id || '');
+          computerButton.setAttribute('data-host-name', host.computer || '');
+          computerButton.textContent = host.computer || 'Unnamed';
+          computerCell.appendChild(computerButton);
           row.appendChild(computerCell);
 
           const groupCell = document.createElement('td');
@@ -412,6 +714,8 @@ def dashboard_page(store: DataStore, query: dict[str, str]) -> bytes:
 
           tableBody.appendChild(row);
         });
+
+        attachHostHandlers();
       };
 
       const fetchHosts = () => {
@@ -437,11 +741,12 @@ def dashboard_page(store: DataStore, query: dict[str, str]) -> bytes:
 
       fetchHosts();
       setInterval(fetchHosts, 5000);
+      attachHostHandlers();
     })();
     </script>
     """
 
-    content = add_form + table_html + auto_refresh_script
+    content = add_form + table_html + modal_html + auto_refresh_script
     return render_template("Dashboard", content)
 
 
@@ -545,6 +850,32 @@ def application_factory(store: DataStore, sessions: SessionStore):
                     }
                     for host in hosts
                 ]
+            }
+            return json_response(start_response, "200 OK", payload)
+
+        if path == "/api/host_log":
+            host_id = query.get("host_id", "").strip()
+            if not host_id:
+                return json_response(start_response, "400 Bad Request", {"error": "host_id is required"})
+            host = store.get_host(host_id)
+            if not host:
+                return json_response(start_response, "404 Not Found", {"error": "Host not found"})
+            entries = store.get_host_log(host_id)
+            payload = {
+                "host": {
+                    "id": host.get("id"),
+                    "computer": host.get("computer", ""),
+                    "group": host.get("group", ""),
+                    "ip": host.get("ip", ""),
+                },
+                "entries": [
+                    {
+                        "ts": float(entry.get("ts", 0.0)),
+                        "timestamp": entry.get("timestamp", ""),
+                        "status": entry.get("status", "unknown"),
+                    }
+                    for entry in entries
+                ],
             }
             return json_response(start_response, "200 OK", payload)
 
